@@ -4,26 +4,39 @@ A minimal, text-only flashcard app using the [FSRS](https://github.com/open-spac
 
 ## Features
 
-- Multiple decks, each with generic **Front / Back** text cards.
-- Import from **CSV**, **Excel** (`.xlsx`/`.xls`), **Anki** `.apkg` (text only) or the **provided decks** in `decks/`.
-- Checkbox selection screen (search, select all/none) before cards are added to a deck.
-- Study direction chosen when you open a deck: front→back, back→front or both. Each direction has its **own independent FSRS schedule** (stored under `cardId|f` and `cardId|r`).
-- Again / Hard / Good / Easy buttons, FSRS default parameters.
-- Anki-like defaults: 20 new cards/day, 200 reviews/day (changeable in deck settings).
-- Day rollover at **local midnight** of the device (not server time).
-- All data is stored in the browser's `localStorage` on that device. There is no sync.
-- **Export** button in deck settings: downloads JSON with cards, settings and schedule/progress.
-- Light/dark mode toggle.
+- **Anki-style home screen**: a pill nav bar (Decks, Add, Browse, Stats, Sync) and a deck table with **New / Learn / Due** counts (blue / red / green when above 0, grey otherwise). Counts come from the real FSRS state and the daily limits.
+- Click a deck to **study it straight away**. Each deck row has a gear menu (Rename, Options, Export, Delete) that appears on hover (always visible on touch devices).
+- "Studied N cards in X seconds today" is tracked per local day.
+- **Get Shared**, **Create Deck** and **Import File** buttons below the table.
+- **Add** a card to a deck, **Browse** (search, edit, delete) all cards, simple **Stats**, and **Sync**, which exports/imports a JSON backup of all app data (data is stored on this device only).
+- Study always shows the **front first**, then **Show Answer** reveals the back, then Again / Hard / Good / Easy (FSRS default parameters, next-interval labels). Shortcuts: Space = show answer, 1-4 = Again/Hard/Good/Easy.
+- There is **no direction choice** any more. Data saved by older versions still loads: `cardId|f` schedules are used, `cardId|r` (reverse) entries are ignored and kept untouched.
+- Anki-like defaults: 20 new cards/day, 200 reviews/day (deck Options). Day rollover at **local midnight** of the device.
+- Light/dark mode toggle (top-right corner). Works on desktop and iPhone.
 
-## Running locally
+## Get Shared (provided decks)
 
-Use any static file server (the app uses `fetch`, so don't open `index.html` via `file://`):
+Press **Get Shared** on the home screen (or choose a provided deck from **Create Deck**) to see the decks listed in `decks/index.json`. Pick one, tick the cards you want (search, select all/none), edit the deck name and confirm. No file upload is needed.
+
+To add a provided deck, drop a CSV (header row, `front` and `back` columns) into `decks/` and list it in `decks/index.json`:
+
+```json
+[{"name": "My deck", "file": "my-deck.csv", "description": "Short description"}]
+```
+
+Paths are relative, so this works on GitHub Pages and on a local server. Opening `index.html` via `file://` cannot load them; the app shows a message explaining that it must be served over http(s).
+
+**Import File** (CSV / Excel / Anki `.apkg`) remains available as a secondary option.
+
+## Testing locally
+
+The app uses `fetch`, so serve it over http. From the folder containing `index.html` (Windows PowerShell or any OS):
 
 ```
-python3 -m http.server 8000
+py -m http.server 8000
 ```
 
-then open http://localhost:8000.
+or `python -m http.server 8000`, or `npx serve .`, then open http://localhost:8000. (`python3` may not work on Windows.) Opening the file directly (`file://`) will not work for provided decks.
 
 ## Hosting on GitHub Pages
 
@@ -46,4 +59,4 @@ ts-fsrs 5.4.2 (FSRS), SheetJS `xlsx` 0.18.5 (mini build), JSZip and sql.js (SQLi
 
 ## Status
 
-Implemented: everything above. Deferred: Anki scheduling/history import, media/cloze, FSRS parameter optimisation, re-importing exported JSON, editing individual cards, sync, offline service worker.
+Implemented: everything above. Deferred: Anki scheduling/history import, media/cloze, FSRS parameter optimisation, re-importing single-deck exported JSON, sync, offline service worker.

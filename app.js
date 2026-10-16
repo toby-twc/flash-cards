@@ -3,7 +3,7 @@
 
 const STORE_KEY = 'flashcards.v1';
 const DEFAULTS = { newPerDay: 20, reviewsPerDay: 200 };
-const DIRS = { f: 'Front → Back', r: 'Back → Front', b: 'Both directions' };
+const NO_HTTP_MSG = 'Could not load the provided decks. This app must be served over http(s) (for example run "python -m http.server 8000" in this folder and open http://localhost:8000); opening index.html directly via file:// does not work.';
 const fsrs = FSRS.fsrs(FSRS.generatorParameters());
 const { Rating, State } = FSRS;
 
@@ -14,7 +14,7 @@ function load() {
     const s = JSON.parse(localStorage.getItem(STORE_KEY));
     if (s && s.decks) return s;
   } catch (e) { /* ignore corrupt data */ }
-  return { decks: {}, theme: null };
+  return { decks: {}, theme: null, studied: null };
 }
 function save() {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
@@ -156,7 +156,8 @@ async function parseFile(file) {
 }
 
 // ---------- scheduling ----------
-function schedKey(cid, dir) { return cid + '|' + dir; }
+// Only the front->back schedule (`cardId|f`) is used. Legacy `cardId|r` entries are ignored but never deleted.
+function schedKey(cid) { return cid + '|f'; }
 function reviveCard(o) {
   return Object.assign({}, o, { due: new Date(o.due), last_review: o.last_review ? new Date(o.last_review) : undefined });
 }
@@ -168,17 +169,14 @@ function dailyCounts(deck, now) {
   if (!deck.daily || deck.daily.date !== day) deck.daily = { date: day, newDone: 0, reviewsDone: 0 };
   return deck.daily;
 }
-function allItems(deck, dir) {
-  const dirs = dir === 'b' ? ['f', 'r'] : [dir];
-  const out = [];
-  for (const card of deck.cards) for (const d of dirs) out.push({ card, dir: d, key: schedKey(card.id, d) });
-  return out;
+function allItems(deck) {
+  return deck.cards.map(card => ({ card, key: schedKey(card.id) }));
 }
-function counts(deck, dir, now) {
+function counts(deck, now) {
   const daily = dailyCounts(deck, now);
   const end = nextMidnight(now);
   let nw = 0, learn = 0, rev = 0;
-  for (const it of allItems(deck, dir)) {
+  for (const it of allItems(deck)) {
     const s = deck.sched[it.key];
     if (!s) nw++;
     else if (s.state === State.Review) { if (new Date(s.due) < end) rev++; }
@@ -190,12 +188,12 @@ function counts(deck, dir, now) {
     learn, totalNew: nw
   };
 }
-function pickNext(deck, dir, now) {
+function pickNext(deck, now) {
   const daily = dailyCounts(deck, now);
   const end = nextMidnight(now);
   const learn = [], rev = [], nw = [];
   let nextLearn = null;
-  for (const it of allItems(deck, dir)) {
+  for (const it of allItems(deck)) {
     const s = deck.sched[it.key];
     if (!s) { nw.push(it); continue; }
     const due = new Date(s.due);
@@ -209,84 +207,181 @@ function pickNext(deck, dir, now) {
   if (nw.length && daily.newDone < deck.settings.newPerDay) return { item: nw[0] };
   return { item: null, nextLearn };
 }
+function studiedToday(now) {
+  const day = localDay(now);
+  if (!state.studied || state.studied.date !== day) state.studied = { date: day, count: 0, ms: 0 };
+  return state.studied;
+}
 
-// ---------- export ----------
-function exportDeck(deck) {
-  const data = {
-    format: 'flash-cards-deck', version: 1, exportedAt: new Date().toISOString(),
-    deck: { id: deck.id, name: deck.name, settings: deck.settings, cards: deck.cards },
-    schedule: deck.sched, daily: deck.daily || null
-  };
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-  const a = h('a', { href: URL.createObjectURL(blob), download: (deck.name.replace(/[^\w\-]+/g, '_') || 'deck') + '.json' });
+// ---------- export / backup ----------
+function download(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+  const a = h('a', { href: URL.createObjectURL(blob), download: filename });
   document.body.append(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function safeName(n) { return n.replace(/[^\w\-]+/g, '_') || 'deck'; }
+function exportDeck(deck) {
+  const schedule = {};
+  for (const c of deck.cards) if (deck.sched[schedKey(c.id)]) schedule[schedKey(c.id)] = deck.sched[schedKey(c.id)];
+  download({
+    format: 'flash-cards-deck', version: 2, exportedAt: new Date().toISOString(),
+    deck: { id: deck.id, name: deck.name, settings: deck.settings, cards: deck.cards },
+    schedule, daily: deck.daily || null
+  }, safeName(deck.name) + '.json');
+}
+
+// ---------- provided decks ----------
+async function fetchProvided(path, asJson) {
+  let r;
+  try { r = await fetch(path); }
+  catch (e) { throw new Error(NO_HTTP_MSG); }
+  if (!r.ok) throw new Error('Could not load ' + path + ' (HTTP ' + r.status + ').');
+  try { return asJson ? await r.json() : await r.text(); }
+  catch (e) { throw new Error('Could not read ' + path + '.'); }
+}
+const loadProvidedList = () => fetchProvided('decks/index.json', true);
+async function loadProvidedCards(d) {
+  return rowsToCards(parseCSV(await fetchProvided('decks/' + encodeURIComponent(d.file), false)));
+}
+// Renders the provided decks into `box`; onPick(deckEntry) is called when one is chosen.
+async function renderProvided(box, msg, onPick) {
+  box.replaceChildren(h('p', { class: 'muted' }, 'Loading…'));
+  let list;
+  try { list = await loadProvidedList(); }
+  catch (e) { box.replaceChildren(); msg.textContent = e.message; return; }
+  if (!Array.isArray(list) || !list.length) { box.replaceChildren(h('p', { class: 'muted' }, 'No provided decks.')); return; }
+  box.replaceChildren(...list.map(d => {
+    const info = h('div', { class: 'muted' }, d.description || '');
+    loadProvidedCards(d).then(c => { info.textContent = c.length + ' cards' + (d.description ? ' · ' + d.description : ''); }, () => {});
+    return h('div', { class: 'item' },
+      h('div', { class: 'grow' }, h('strong', {}, d.name), info),
+      h('button', { class: 'primary', onclick: () => onPick(d) }, 'Select'));
+  }));
+}
+async function pickProvided(d, msg, name) {
+  msg.textContent = 'Loading…';
+  try {
+    pending = { cards: await loadProvidedCards(d), deckId: null, name: name || d.name };
+    go('#/select');
+  } catch (e) { msg.textContent = e.message; }
 }
 
 // ---------- views ----------
 const app = document.getElementById('app');
 let pending = null;
 let session = null;
+let closeMenu = null;
 
-function show(...nodes) { app.replaceChildren(...nodes.flat().filter(n => n)); }
+function show(...nodes) {
+  if (closeMenu) closeMenu();
+  app.replaceChildren(...nodes.flat().filter(n => n));
+  const active = (location.hash.replace(/^#\/?/, '').split('/')[0]) || 'decks';
+  const section = { add: 'add', browse: 'browse', stats: 'stats', sync: 'sync' }[active] || (active === 'deck' || active === 'decks' ? 'decks' : '');
+  document.querySelectorAll('nav a').forEach(a => a.classList.toggle('active', a.dataset.nav === section));
+}
 function go(hash) { location.hash = hash; }
+function newDeck(name) {
+  const deck = { id: uid(), name: name || 'New deck', cards: [], sched: {}, settings: Object.assign({}, DEFAULTS), daily: null };
+  state.decks[deck.id] = deck;
+  return deck;
+}
 
 function viewLibrary() {
+  const now = new Date();
   const decks = Object.values(state.decks);
+  const num = (n, cls) => h('td', { class: 'num ' + (n > 0 ? cls : 'zero') }, n);
+  const rows = decks.map(d => {
+    const c = counts(d, now);
+    const gear = h('button', { class: 'gear', 'aria-label': 'Options for ' + d.name, onclick: e => { e.stopPropagation(); openMenu(gear, d); } }, '⚙');
+    return h('tr', { class: 'deckrow', tabindex: 0, onclick: () => go('#/deck/' + d.id + '/study'),
+      onkeydown: e => { if (e.key === 'Enter' && e.target === e.currentTarget) go('#/deck/' + d.id + '/study'); } },
+      h('td', { class: 'name' }, d.name), num(c.newLeft, 'new'), num(c.learn, 'learn'), num(c.reviewLeft, 'due'),
+      h('td', { class: 'gearcell' }, gear));
+  });
+  const st = studiedToday(now);
+  const secs = Math.round(st.ms / 1000);
   show(
-    h('h2', {}, 'Your decks'),
-    decks.length ? decks.map(d => h('div', { class: 'item' },
-      h('div', { class: 'grow' }, h('strong', {}, d.name), h('div', { class: 'muted' }, d.cards.length + ' cards')),
-      h('button', { class: 'primary', onclick: () => go('#/deck/' + d.id) }, 'Open')
-    )) : h('p', { class: 'muted' }, 'No decks yet.'),
-    h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => go('#/new') }, '+ New deck'))
+    h('div', { class: 'panel' },
+      h('table', { class: 'decks' },
+        h('thead', {}, h('tr', {}, h('th', { class: 'name' }, 'Deck'), h('th', {}, 'New'), h('th', {}, 'Learn'), h('th', {}, 'Due'), h('th', { class: 'gearcell' }))),
+        h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: 5, class: 'empty' }, 'No decks yet. Use Get Shared to pick a provided deck.'))))),
+    h('p', { class: 'center muted' }, 'Studied ' + st.count + ' card' + (st.count === 1 ? '' : 's') + ' in ' + secs + ' second' + (secs === 1 ? '' : 's') +
+      ' today (' + (st.count ? (st.ms / 1000 / st.count).toFixed(1) : '0') + 's/card)'),
+    h('div', { class: 'pills' },
+      h('button', { class: 'pill', onclick: () => go('#/shared') }, 'Get Shared'),
+      h('button', { class: 'pill', onclick: () => go('#/new') }, 'Create Deck'),
+      h('button', { class: 'pill', onclick: () => go('#/import') }, 'Import File'))
   );
 }
 
-async function viewNew(deckId) {
+function openMenu(anchor, deck) {
+  if (closeMenu) closeMenu();
+  const item = (label, fn, cls) => h('button', { class: cls || '', onclick: e => { e.stopPropagation(); closeMenu(); fn(); } }, label);
+  const menu = h('div', { class: 'menu' },
+    item('Rename', () => {
+      const n = prompt('Rename deck', deck.name);
+      if (n && n.trim()) { deck.name = n.trim(); save(); viewLibrary(); }
+    }),
+    item('Options', () => go('#/deck/' + deck.id + '/settings')),
+    item('Export', () => exportDeck(deck)),
+    item('Delete', () => {
+      if (confirm('Delete "' + deck.name + '" and all its progress?')) { delete state.decks[deck.id]; save(); viewLibrary(); }
+    }, 'danger'));
+  const cell = anchor.parentNode;
+  cell.append(menu);
+  const onDoc = e => { if (!menu.contains(e.target)) closeMenu(); };
+  closeMenu = () => { menu.remove(); document.removeEventListener('click', onDoc, true); closeMenu = null; };
+  setTimeout(() => document.addEventListener('click', onDoc, true), 0);
+}
+
+function viewShared() {
+  const msg = h('p', { class: 'err' });
+  const box = h('div');
+  show(h('div', { class: 'panel' },
+    h('h2', {}, 'Get Shared'),
+    h('p', { class: 'muted' }, 'Pick a provided deck, choose which cards to keep, and add it to your decks. No upload needed.'),
+    box, msg,
+    h('div', { class: 'row' }, h('button', { onclick: () => go('#/') }, 'Back'))));
+  renderProvided(box, msg, d => pickProvided(d, msg));
+}
+
+function viewCreate() {
+  const msg = h('p', { class: 'err' });
+  const name = h('input', { type: 'text', placeholder: 'Deck name' });
+  const box = h('div');
+  show(h('div', { class: 'panel' },
+    h('h2', {}, 'Create Deck'),
+    h('label', {}, 'Deck name'), name,
+    h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => {
+      const d = newDeck(name.value.trim()); save(); go('#/deck/' + d.id + '/settings');
+    } }, 'Create empty deck')),
+    h('hr'),
+    h('h3', {}, 'Or start from a provided deck'), box, msg,
+    h('div', { class: 'row' }, h('button', { onclick: () => go('#/') }, 'Back'))));
+  renderProvided(box, msg, d => pickProvided(d, msg, name.value.trim()));
+}
+
+function viewImport(deckId) {
   const existing = deckId ? state.decks[deckId] : null;
   const msg = h('p', { class: 'err' });
   const name = h('input', { type: 'text', placeholder: 'Deck name', value: existing ? existing.name : '' });
-  const finish = (cards, suggested) => {
-    pending = { cards, deckId: existing ? existing.id : null, name: (name.value.trim() || suggested || 'New deck') };
-    go('#/select');
-  };
   const file = h('input', { type: 'file', accept: '.csv,.tsv,.txt,.xlsx,.xls,.apkg' });
   file.addEventListener('change', async () => {
     if (!file.files[0]) return;
     msg.textContent = 'Reading…';
-    try { finish(await parseFile(file.files[0]), file.files[0].name.replace(/\.[^.]+$/, '')); }
-    catch (e) { msg.textContent = e.message; }
-  });
-  const provided = h('select', {}, h('option', { value: '' }, 'Loading…'));
-  let list = [];
-  fetch('decks/index.json').then(r => r.json()).then(l => {
-    list = l;
-    provided.replaceChildren(...l.map((d, i) => h('option', { value: i }, d.name + (d.description ? ' — ' + d.description : ''))));
-    if (!l.length) provided.replaceChildren(h('option', { value: '' }, 'No provided decks'));
-  }).catch(() => provided.replaceChildren(h('option', { value: '' }, 'Provided decks unavailable')));
-  const loadProvided = h('button', { onclick: async () => {
-    const d = list[provided.value];
-    if (!d) return;
-    msg.textContent = 'Loading…';
     try {
-      const r = await fetch('decks/' + encodeURIComponent(d.file));
-      if (!r.ok) throw new Error('Could not load ' + d.file);
-      finish(rowsToCards(parseCSV(await r.text())), d.name);
+      const cards = await parseFile(file.files[0]);
+      pending = { cards, deckId: existing ? existing.id : null, name: name.value.trim() || file.files[0].name.replace(/\.[^.]+$/, '') || 'New deck' };
+      go('#/select');
     } catch (e) { msg.textContent = e.message; }
-  } }, 'Load provided deck');
-  show(
-    h('h2', {}, existing ? 'Add cards to ' + existing.name : 'New deck'),
-    h('label', {}, 'Deck name'), name,
-    h('hr'),
-    h('h3', {}, 'Import a file'),
+  });
+  show(h('div', { class: 'panel' },
+    h('h2', {}, existing ? 'Import cards into ' + existing.name : 'Import File'),
+    existing ? null : [h('label', {}, 'Deck name'), name],
     h('p', { class: 'muted' }, 'CSV, Excel (.xlsx/.xls) with a header row (columns "front" and "back", or the first two columns), or an Anki .apkg (text of the first two fields only).'),
-    file,
-    h('hr'),
-    h('h3', {}, 'Provided decks'), provided, h('div', { class: 'row' }, loadProvided),
-    msg,
-    h('div', { class: 'row' }, h('button', { onclick: () => go(existing ? '#/deck/' + existing.id : '#/') }, 'Cancel'))
-  );
+    file, msg,
+    h('div', { class: 'row' }, h('button', { onclick: () => go(existing ? '#/deck/' + existing.id + '/settings' : '#/') }, 'Cancel'))));
 }
 
 function viewSelect() {
@@ -317,7 +412,7 @@ function viewSelect() {
   const setAll = on => { for (const c of visible()) { on ? checked.add(c.id) : checked.delete(c.id); boxes.get(c.id).checked = on; } update(); };
   const nameInput = h('input', { type: 'text', value: p.name });
   update();
-  show(
+  show(h('div', { class: 'panel' },
     h('h2', {}, 'Choose cards'),
     p.deckId ? h('p', {}, 'Adding to: ', h('strong', {}, state.decks[p.deckId].name)) : [h('label', {}, 'Deck name'), nameInput],
     h('div', { class: 'row' },
@@ -328,79 +423,163 @@ function viewSelect() {
       h('button', { class: 'primary', onclick: () => {
         const chosen = p.cards.filter(c => checked.has(c.id)).map(c => ({ id: c.id, front: c.front, back: c.back }));
         if (!chosen.length) return alert('Select at least one card.');
-        let deck = p.deckId && state.decks[p.deckId];
-        if (!deck) {
-          deck = { id: uid(), name: nameInput.value.trim() || 'New deck', cards: [], sched: {}, settings: Object.assign({}, DEFAULTS), daily: null };
-          state.decks[deck.id] = deck;
-        }
+        const deck = (p.deckId && state.decks[p.deckId]) || newDeck(nameInput.value.trim());
         deck.cards.push(...chosen);
-        save(); pending = null; go('#/deck/' + deck.id);
+        save(); pending = null; go('#/');
       } }, 'Add to deck'),
-      h('button', { onclick: () => { pending = null; go(p.deckId ? '#/deck/' + p.deckId : '#/'); } }, 'Cancel'))
-  );
+      h('button', { onclick: () => { pending = null; go(p.deckId ? '#/deck/' + p.deckId + '/settings' : '#/'); } }, 'Cancel'))));
 }
 
-function viewDeck(deck) {
-  const now = new Date();
-  let dir = deck.lastDir || 'f';
-  const stats = h('p', { class: 'muted' });
-  const refresh = () => {
-    const c = counts(deck, dir, now);
-    stats.textContent = 'New: ' + c.newLeft + ' · Learning: ' + c.learn + ' · Review: ' + c.reviewLeft;
+function deckSelect(selected) {
+  const sel = h('select', {}, Object.values(state.decks).map(d => h('option', { value: d.id }, d.name)));
+  if (selected && state.decks[selected]) sel.value = selected;
+  return sel;
+}
+
+function viewAdd() {
+  const decks = Object.values(state.decks);
+  if (!decks.length) {
+    return show(h('div', { class: 'panel' }, h('h2', {}, 'Add'), h('p', {}, 'Create a deck first.'),
+      h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => go('#/new') }, 'Create Deck'))));
+  }
+  const sel = deckSelect(state.lastAddDeck);
+  const front = h('textarea', { rows: 3 }), back = h('textarea', { rows: 3 });
+  const msg = h('p', { class: 'muted' });
+  show(h('div', { class: 'panel' },
+    h('h2', {}, 'Add'),
+    h('label', {}, 'Deck'), sel,
+    h('label', {}, 'Front'), front,
+    h('label', {}, 'Back'), back,
+    h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => {
+      const f = front.value.trim(), b = back.value.trim();
+      if (!f || !b) { msg.textContent = 'Enter both a front and a back.'; return; }
+      const deck = deckById(sel.value);
+      const id = cardId(f, b);
+      if (deck.cards.some(c => c.id === id)) { msg.textContent = 'That card is already in the deck.'; return; }
+      deck.cards.push({ id, front: f, back: b });
+      state.lastAddDeck = deck.id;
+      save();
+      front.value = ''; back.value = ''; front.focus();
+      msg.textContent = 'Added to ' + deck.name + '.';
+    } }, 'Add card')),
+    msg));
+}
+
+function viewBrowse() {
+  const search = h('input', { type: 'search', placeholder: 'Search all cards…' });
+  const list = h('div');
+  const draw = () => {
+    const q = search.value.toLowerCase();
+    const rows = [];
+    for (const d of Object.values(state.decks)) for (const c of d.cards) {
+      if (!(c.front + ' ' + c.back + ' ' + d.name).toLowerCase().includes(q)) continue;
+      rows.push({ d, c });
+    }
+    const shown = rows.slice(0, 200);
+    list.replaceChildren(
+      h('p', { class: 'muted' }, rows.length + ' card' + (rows.length === 1 ? '' : 's') + (rows.length > shown.length ? ' (showing first 200, refine your search)' : '')),
+      ...shown.map(({ d, c }) => h('div', { class: 'item' },
+        h('div', { class: 'grow' }, h('strong', {}, c.front), h('div', {}, c.back), h('div', { class: 'muted' }, d.name)),
+        h('button', { onclick: () => edit(d, c) }, 'Edit'),
+        h('button', { class: 'danger', onclick: () => {
+          if (!confirm('Delete this card?')) return;
+          d.cards = d.cards.filter(x => x !== c);
+          delete d.sched[schedKey(c.id)]; delete d.sched[c.id + '|r'];
+          save(); draw();
+        } }, 'Delete'))));
   };
-  const radios = Object.entries(DIRS).map(([k, label]) => {
-    const r = h('input', { type: 'radio', name: 'dir', value: k });
-    r.checked = k === dir;
-    r.addEventListener('change', () => { dir = k; refresh(); });
-    return h('label', {}, r, ' ', label);
+  const edit = (d, c) => {
+    const f = h('textarea', { rows: 2 }), b = h('textarea', { rows: 2 });
+    f.value = c.front; b.value = c.back;
+    show(h('div', { class: 'panel' }, h('h2', {}, 'Edit card'),
+      h('label', {}, 'Front'), f, h('label', {}, 'Back'), b,
+      h('div', { class: 'row' },
+        h('button', { class: 'primary', onclick: () => {
+          if (!f.value.trim() || !b.value.trim()) return alert('Front and back are required.');
+          c.front = f.value.trim(); c.back = b.value.trim(); save(); viewBrowse();
+        } }, 'Save'),
+        h('button', { onclick: () => viewBrowse() }, 'Cancel'))));
+  };
+  search.addEventListener('input', draw);
+  draw();
+  show(h('div', { class: 'panel' }, h('h2', {}, 'Browse'), search, list));
+}
+
+function viewStats() {
+  const now = new Date();
+  const st = studiedToday(now);
+  const decks = Object.values(state.decks);
+  const rows = decks.map(d => {
+    let nw = 0, learn = 0, young = 0, mature = 0;
+    for (const it of allItems(d)) {
+      const s = d.sched[it.key];
+      if (!s) nw++;
+      else if (s.state !== State.Review) learn++;
+      else if ((s.scheduled_days || 0) >= 21) mature++;
+      else young++;
+    }
+    return h('tr', {}, h('td', { class: 'name' }, d.name), h('td', { class: 'num' }, d.cards.length), h('td', { class: 'num' }, nw),
+      h('td', { class: 'num' }, learn), h('td', { class: 'num' }, young), h('td', { class: 'num' }, mature));
   });
-  refresh();
-  show(
-    h('h2', {}, deck.name),
-    h('p', { class: 'muted' }, deck.cards.length + ' cards'),
-    h('h3', {}, 'Study direction'), radios, stats,
-    h('div', { class: 'row' },
-      h('button', { class: 'primary', onclick: () => {
-        deck.lastDir = dir; save();
-        session = { deckId: deck.id, dir, revealed: false, current: null };
-        go('#/deck/' + deck.id + '/study');
-      } }, 'Study'),
-      h('button', { onclick: () => go('#/deck/' + deck.id + '/settings') }, 'Settings'),
-      h('button', { onclick: () => go('#/') }, 'Back'))
-  );
+  show(h('div', { class: 'panel' },
+    h('h2', {}, 'Stats'),
+    h('p', {}, 'Today: ' + st.count + ' card' + (st.count === 1 ? '' : 's') + ' studied in ' + Math.round(st.ms / 1000) + ' seconds.'),
+    h('table', { class: 'decks' },
+      h('thead', {}, h('tr', {}, h('th', { class: 'name' }, 'Deck'), h('th', {}, 'Cards'), h('th', {}, 'New'), h('th', {}, 'Learning'), h('th', {}, 'Young'), h('th', {}, 'Mature'))),
+      h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: 6, class: 'empty' }, 'No decks yet.')))),
+    h('p', { class: 'muted' }, 'Young = review interval under 21 days; Mature = 21 days or more.')));
+}
+
+function viewSync() {
+  const msg = h('p', { class: 'muted' });
+  const file = h('input', { type: 'file', accept: '.json,application/json' });
+  file.addEventListener('change', async () => {
+    if (!file.files[0]) return;
+    try {
+      const data = JSON.parse(await file.files[0].text());
+      if (!data || data.format !== 'flash-cards-backup' || !data.state || typeof data.state.decks !== 'object') throw new Error('Not a Flash Cards backup file.');
+      if (!confirm('Replace all data on this device with the backup?')) return;
+      state = Object.assign({ decks: {}, theme: null, studied: null }, data.state);
+      save(); applyTheme(); go('#/');
+    } catch (e) { msg.textContent = 'Import failed: ' + e.message; msg.className = 'err'; }
+  });
+  show(h('div', { class: 'panel' },
+    h('h2', {}, 'Sync'),
+    h('p', { class: 'muted' }, 'There is no online sync. Your decks and progress are stored on this device only (in this browser). Use a backup to move them to another device or to keep a safe copy.'),
+    h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => download({ format: 'flash-cards-backup', version: 2, exportedAt: new Date().toISOString(), state }, 'flash-cards-backup.json') }, 'Export backup')),
+    h('label', {}, 'Import backup (replaces current data)'), file, msg));
 }
 
 function viewStudy(deck) {
-  if (!session || session.deckId !== deck.id) return go('#/deck/' + deck.id);
+  if (!session || session.deckId !== deck.id) session = { deckId: deck.id, revealed: false, current: null };
   const now = new Date();
-  const { item, nextLearn } = pickNext(deck, session.dir, now);
-  const done = (text) => show(
+  const { item, nextLearn } = pickNext(deck, now);
+  const done = (text) => { session.current = null; show(h('div', { class: 'panel' },
     h('h2', {}, deck.name),
     h('p', {}, text),
     h('div', { class: 'row' },
       nextLearn && h('button', { onclick: () => viewStudy(deck) }, 'Check again'),
-      h('button', { class: 'primary', onclick: () => go('#/deck/' + deck.id) }, 'Done'))
-  );
+      h('button', { class: 'primary', onclick: () => go('#/') }, 'Done')))); };
   if (!item) {
     return done(nextLearn
       ? 'Nothing due right now. Next card in ' + fmtInterval(nextLearn, now) + '.'
-      : 'All done for today! 🎉');
+      : deck.cards.length ? 'All done for today! 🎉' : 'This deck has no cards yet.');
   }
-  session.current = item; session.revealed = false;
+  session.current = item; session.revealed = false; session.shownAt = Date.now();
   const fsrsCard = getFsrsCard(deck, item.key);
-  const q = item.dir === 'f' ? item.card.front : item.card.back;
-  const a = item.dir === 'f' ? item.card.back : item.card.front;
+  const reveal = () => { session.revealed = true; draw(); };
   const draw = () => {
     const rec = session.revealed ? fsrs.repeat(fsrsCard, now) : null;
     const grade = (label, g) => h('button', { class: g === Rating.Good ? 'primary' : '', onclick: () => rate(g) },
       label, h('div', { class: 'muted' }, fmtInterval(rec[g].card.due, now)));
+    session.reveal = session.revealed ? null : reveal;
+    session.rate = session.revealed ? rate : null;
     show(
-      h('div', { class: 'muted' }, DIRS[item.dir]),
-      h('div', { class: 'cardface' }, session.revealed ? [h('div', {}, q), h('hr'), h('div', {}, a)] : q),
+      h('div', { class: 'cardface' }, session.revealed ? [h('div', {}, item.card.front), h('hr'), h('div', {}, item.card.back)] : item.card.front),
       session.revealed
         ? h('div', { class: 'grades' }, grade('Again', Rating.Again), grade('Hard', Rating.Hard), grade('Good', Rating.Good), grade('Easy', Rating.Easy))
-        : h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => { session.revealed = true; draw(); } }, 'Show answer')),
-      h('div', { class: 'row' }, h('button', { onclick: () => go('#/deck/' + deck.id) }, 'Stop'))
+        : h('div', { class: 'row center' }, h('button', { class: 'primary', onclick: reveal }, 'Show Answer')),
+      h('div', { class: 'row center' }, h('button', { onclick: () => go('#/') }, 'Stop'))
     );
   };
   const rate = (g) => {
@@ -408,6 +587,8 @@ function viewStudy(deck) {
     const daily = dailyCounts(deck, t);
     if (!deck.sched[item.key]) daily.newDone++;
     else if (deck.sched[item.key].state === State.Review) daily.reviewsDone++;
+    const st = studiedToday(t);
+    st.count++; st.ms += Math.min(60000, t - session.shownAt);
     deck.sched[item.key] = fsrs.next(fsrsCard, t, g).card;
     save();
     viewStudy(deck);
@@ -420,8 +601,8 @@ function viewSettings(deck) {
   const np = h('input', { type: 'number', min: 0, value: deck.settings.newPerDay });
   const rp = h('input', { type: 'number', min: 0, value: deck.settings.reviewsPerDay });
   const num = (el, def) => { const n = parseInt(el.value, 10); return Number.isFinite(n) && n >= 0 ? n : def; };
-  show(
-    h('h2', {}, 'Deck settings'),
+  show(h('div', { class: 'panel' },
+    h('h2', {}, 'Deck options'),
     h('label', {}, 'Name'), name,
     h('label', {}, 'New cards per day'), np,
     h('label', {}, 'Maximum reviews per day'), rp,
@@ -431,34 +612,39 @@ function viewSettings(deck) {
         deck.name = name.value.trim() || deck.name;
         deck.settings.newPerDay = num(np, DEFAULTS.newPerDay);
         deck.settings.reviewsPerDay = num(rp, DEFAULTS.reviewsPerDay);
-        save(); go('#/deck/' + deck.id);
+        save(); go('#/');
       } }, 'Save'),
       h('button', { onclick: () => exportDeck(deck) }, 'Export'),
-      h('button', { onclick: () => go('#/new/' + deck.id) }, 'Add cards'),
-      h('button', { onclick: () => go('#/deck/' + deck.id) }, 'Back')),
+      h('button', { onclick: () => go('#/import/' + deck.id) }, 'Import cards'),
+      h('button', { onclick: () => go('#/') }, 'Back')),
     h('hr'),
     h('button', { class: 'danger', onclick: () => {
       if (confirm('Delete "' + deck.name + '" and all its progress?')) { delete state.decks[deck.id]; save(); go('#/'); }
-    } }, 'Delete deck')
-  );
+    } }, 'Delete deck')));
 }
 
 function route() {
   const parts = location.hash.replace(/^#\/?/, '').split('/');
   const deck = parts[0] === 'deck' && deckById(parts[1]);
-  if (parts[0] === 'new') viewNew(parts[1] && deckById(parts[1]) ? parts[1] : null);
+  if (parts[0] === 'shared') viewShared();
+  else if (parts[0] === 'new') viewCreate();
+  else if (parts[0] === 'import') viewImport(parts[1] && deckById(parts[1]) ? parts[1] : null);
   else if (parts[0] === 'select') viewSelect();
-  else if (deck && parts[2] === 'study') viewStudy(deck);
+  else if (parts[0] === 'add') viewAdd();
+  else if (parts[0] === 'browse') viewBrowse();
+  else if (parts[0] === 'stats') viewStats();
+  else if (parts[0] === 'sync') viewSync();
   else if (deck && parts[2] === 'settings') viewSettings(deck);
-  else if (deck) viewDeck(deck);
+  else if (deck) viewStudy(deck);
   else viewLibrary();
 }
 
 document.addEventListener('keydown', e => {
-  if (!session || !session.current || !/\/study$/.test(location.hash) || /INPUT|SELECT|TEXTAREA/.test(e.target.tagName)) return;
-  const btns = app.querySelectorAll('.grades button, .row .primary');
-  if (e.key === ' ' && !session.revealed) { e.preventDefault(); btns[0] && btns[0].click(); }
-  else if (session.revealed && '1234'.includes(e.key) && e.key) { const b = app.querySelectorAll('.grades button')[+e.key - 1]; b && b.click(); }
+  if (!session || !session.current || !/\/study$|^#\/deck\/[^/]+$/.test(location.hash) || /INPUT|SELECT|TEXTAREA/.test(e.target.tagName)) return;
+  if (e.key === ' ' && session.reveal) { e.preventDefault(); session.reveal(); }
+  else if (session.rate && '1234'.includes(e.key) && e.key.length === 1) {
+    session.rate([Rating.Again, Rating.Hard, Rating.Good, Rating.Easy][+e.key - 1]);
+  }
 });
 
 window.addEventListener('hashchange', route);
