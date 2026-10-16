@@ -1,0 +1,4 @@
+[
+  {"name": "Norwegian basics", "file": "norwegian-basics.csv", "description": "Common Norwegian words (front: Norwegian, back: English)"},
+  {"name": "German basics", "file": "german-basics.csv", "description": "Common German words (front: German, back: English)"}
+]
