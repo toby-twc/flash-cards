@@ -36,6 +36,7 @@ function h(tag, attrs, ...kids) {
   }
   return el;
 }
+function deckById(id) { return Object.hasOwn(state.decks, id) ? state.decks[id] : null; }
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 function cardId(front, back) {
   let x = 5381;
@@ -444,8 +445,8 @@ function viewSettings(deck) {
 
 function route() {
   const parts = location.hash.replace(/^#\/?/, '').split('/');
-  const deck = parts[0] === 'deck' && state.decks[parts[1]];
-  if (parts[0] === 'new') viewNew(parts[1] && state.decks[parts[1]] ? parts[1] : null);
+  const deck = parts[0] === 'deck' && deckById(parts[1]);
+  if (parts[0] === 'new') viewNew(parts[1] && deckById(parts[1]) ? parts[1] : null);
   else if (parts[0] === 'select') viewSelect();
   else if (deck && parts[2] === 'study') viewStudy(deck);
   else if (deck && parts[2] === 'settings') viewSettings(deck);
