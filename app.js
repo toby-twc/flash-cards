@@ -12,9 +12,20 @@ let state = load();
 function load() {
   try {
     const s = JSON.parse(localStorage.getItem(STORE_KEY));
-    if (s && s.decks) return s;
+    if (s && s.decks) return migrate(s);
   } catch (e) { /* ignore corrupt data */ }
   return { decks: {}, theme: null, studied: null };
+}
+// Cards without an `included` flag count as included only if they already have a schedule (so existing progress stays visible).
+function migrate(s) {
+  for (const d of Object.values(s.decks)) {
+    if (!d || !Array.isArray(d.cards)) continue;
+    if (!d.sched || typeof d.sched !== 'object') d.sched = {};
+    for (const c of d.cards) {
+      if (typeof c.included !== 'boolean') c.included = !!d.sched[c.id + '|f'];
+    }
+  }
+  return s;
 }
 function save() {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
@@ -110,7 +121,7 @@ function rowsToCards(rows) {
     const id = cardId(front, back);
     if (seen.has(id)) continue;
     seen.add(id);
-    cards.push({ id, front, back });
+    cards.push({ id, front, back, included: false });
   }
   if (!cards.length) throw new Error('No cards with both a front and a back were found.');
   return cards;
@@ -170,7 +181,7 @@ function dailyCounts(deck, now) {
   return deck.daily;
 }
 function allItems(deck) {
-  return deck.cards.map(card => ({ card, key: schedKey(card.id) }));
+  return deck.cards.filter(card => card.included !== false).map(card => ({ card, key: schedKey(card.id) }));
 }
 function counts(deck, now) {
   const daily = dailyCounts(deck, now);
@@ -271,6 +282,7 @@ async function pickProvided(d, msg, name) {
 const app = document.getElementById('app');
 let pending = null;
 let session = null;
+let browseFilter = { deck: '', inc: 'all', q: '' };
 let closeMenu = null;
 
 function show(...nodes) {
@@ -421,7 +433,7 @@ function viewSelect() {
     search, listEl,
     h('div', { class: 'row' },
       h('button', { class: 'primary', onclick: () => {
-        const chosen = p.cards.filter(c => checked.has(c.id)).map(c => ({ id: c.id, front: c.front, back: c.back }));
+        const chosen = p.cards.filter(c => checked.has(c.id)).map(c => ({ id: c.id, front: c.front, back: c.back, included: false }));
         if (!chosen.length) return alert('Select at least one card.');
         const deck = (p.deckId && state.decks[p.deckId]) || newDeck(nameInput.value.trim());
         deck.cards.push(...chosen);
@@ -456,7 +468,7 @@ function viewAdd() {
       const deck = deckById(sel.value);
       const id = cardId(f, b);
       if (deck.cards.some(c => c.id === id)) { msg.textContent = 'That card is already in the deck.'; return; }
-      deck.cards.push({ id, front: f, back: b });
+      deck.cards.push({ id, front: f, back: b, included: false });
       state.lastAddDeck = deck.id;
       save();
       front.value = ''; back.value = ''; front.focus();
@@ -465,20 +477,40 @@ function viewAdd() {
     msg));
 }
 
-function viewBrowse() {
-  const search = h('input', { type: 'search', placeholder: 'Search all cards…' });
+function viewBrowse(deckId) {
+  if (deckId !== undefined) browseFilter = { deck: deckId && deckById(deckId) ? deckId : '', inc: 'all', q: '' };
+  const f = browseFilter;
+  const search = h('input', { type: 'search', placeholder: 'Search all cards…', value: f.q });
+  const deckSel = h('select', {}, h('option', { value: '' }, 'All decks'), Object.values(state.decks).map(d => h('option', { value: d.id }, d.name)));
+  deckSel.value = f.deck;
+  const incSel = h('select', {}, h('option', { value: 'all' }, 'All'), h('option', { value: 'yes' }, 'Included'), h('option', { value: 'no' }, 'Not included'));
+  incSel.value = f.inc;
+  const countEl = h('p', { class: 'muted' });
   const list = h('div');
+  let rows = [];
+  const updateCount = () => {
+    const n = rows.filter(r => r.c.included).length;
+    countEl.textContent = n + ' of ' + rows.length + ' included' + (rows.length > 200 ? ' (showing first 200, refine your search)' : '');
+  };
   const draw = () => {
-    const q = search.value.toLowerCase();
-    const rows = [];
-    for (const d of Object.values(state.decks)) for (const c of d.cards) {
-      if (!(c.front + ' ' + c.back + ' ' + d.name).toLowerCase().includes(q)) continue;
-      rows.push({ d, c });
+    const q = f.q.toLowerCase();
+    rows = [];
+    for (const d of Object.values(state.decks)) {
+      if (f.deck && d.id !== f.deck) continue;
+      for (const c of d.cards) {
+        if (f.inc === 'yes' && !c.included) continue;
+        if (f.inc === 'no' && c.included) continue;
+        if (!(c.front + ' ' + c.back + ' ' + d.name).toLowerCase().includes(q)) continue;
+        rows.push({ d, c });
+      }
     }
-    const shown = rows.slice(0, 200);
-    list.replaceChildren(
-      h('p', { class: 'muted' }, rows.length + ' card' + (rows.length === 1 ? '' : 's') + (rows.length > shown.length ? ' (showing first 200, refine your search)' : '')),
-      ...shown.map(({ d, c }) => h('div', { class: 'item' },
+    updateCount();
+    list.replaceChildren(...rows.slice(0, 200).map(({ d, c }) => {
+      const cb = h('input', { type: 'checkbox', 'aria-label': 'Include' });
+      cb.checked = !!c.included;
+      cb.addEventListener('change', () => { c.included = cb.checked; save(); updateCount(); });
+      return h('div', { class: 'item' },
+        h('label', { class: 'incl' }, cb, h('span', { class: 'muted' }, 'Include')),
         h('div', { class: 'grow' }, h('strong', {}, c.front), h('div', {}, c.back), h('div', { class: 'muted' }, d.name)),
         h('button', { onclick: () => edit(d, c) }, 'Edit'),
         h('button', { class: 'danger', onclick: () => {
@@ -486,23 +518,32 @@ function viewBrowse() {
           d.cards = d.cards.filter(x => x !== c);
           delete d.sched[schedKey(c.id)]; delete d.sched[c.id + '|r'];
           save(); draw();
-        } }, 'Delete'))));
+        } }, 'Delete'));
+    }));
   };
+  const setAll = on => { for (const r of rows) r.c.included = on; save(); draw(); };
   const edit = (d, c) => {
-    const f = h('textarea', { rows: 2 }), b = h('textarea', { rows: 2 });
-    f.value = c.front; b.value = c.back;
+    const fr = h('textarea', { rows: 2 }), b = h('textarea', { rows: 2 });
+    fr.value = c.front; b.value = c.back;
     show(h('div', { class: 'panel' }, h('h2', {}, 'Edit card'),
-      h('label', {}, 'Front'), f, h('label', {}, 'Back'), b,
+      h('label', {}, 'Front'), fr, h('label', {}, 'Back'), b,
       h('div', { class: 'row' },
         h('button', { class: 'primary', onclick: () => {
-          if (!f.value.trim() || !b.value.trim()) return alert('Front and back are required.');
-          c.front = f.value.trim(); c.back = b.value.trim(); save(); viewBrowse();
+          if (!fr.value.trim() || !b.value.trim()) return alert('Front and back are required.');
+          c.front = fr.value.trim(); c.back = b.value.trim(); save(); viewBrowse();
         } }, 'Save'),
         h('button', { onclick: () => viewBrowse() }, 'Cancel'))));
   };
-  search.addEventListener('input', draw);
+  search.addEventListener('input', () => { f.q = search.value; draw(); });
+  deckSel.addEventListener('change', () => { f.deck = deckSel.value; draw(); });
+  incSel.addEventListener('change', () => { f.inc = incSel.value; draw(); });
   draw();
-  show(h('div', { class: 'panel' }, h('h2', {}, 'Browse'), search, list));
+  show(h('div', { class: 'panel' }, h('h2', {}, 'Browse'), search,
+    h('div', { class: 'row' }, deckSel, incSel),
+    h('div', { class: 'row' },
+      h('button', { onclick: () => setAll(true) }, 'Include all shown'),
+      h('button', { onclick: () => setAll(false) }, 'Exclude all shown')),
+    countEl, list));
 }
 
 function viewStats() {
@@ -518,14 +559,14 @@ function viewStats() {
       else if ((s.scheduled_days || 0) >= 21) mature++;
       else young++;
     }
-    return h('tr', {}, h('td', { class: 'name' }, d.name), h('td', { class: 'num' }, d.cards.length), h('td', { class: 'num' }, nw),
+    return h('tr', {}, h('td', { class: 'name' }, d.name), h('td', { class: 'num' }, nw + learn + young + mature), h('td', { class: 'num' }, nw),
       h('td', { class: 'num' }, learn), h('td', { class: 'num' }, young), h('td', { class: 'num' }, mature));
   });
   show(h('div', { class: 'panel' },
     h('h2', {}, 'Stats'),
     h('p', {}, 'Today: ' + st.count + ' card' + (st.count === 1 ? '' : 's') + ' studied in ' + Math.round(st.ms / 1000) + ' seconds.'),
     h('table', { class: 'decks' },
-      h('thead', {}, h('tr', {}, h('th', { class: 'name' }, 'Deck'), h('th', {}, 'Cards'), h('th', {}, 'New'), h('th', {}, 'Learning'), h('th', {}, 'Young'), h('th', {}, 'Mature'))),
+      h('thead', {}, h('tr', {}, h('th', { class: 'name' }, 'Deck'), h('th', {}, 'Included'), h('th', {}, 'New'), h('th', {}, 'Learning'), h('th', {}, 'Young'), h('th', {}, 'Mature'))),
       h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: 6, class: 'empty' }, 'No decks yet.')))),
     h('p', { class: 'muted' }, 'Young = review interval under 21 days; Mature = 21 days or more.')));
 }
@@ -539,7 +580,7 @@ function viewSync() {
       const data = JSON.parse(await file.files[0].text());
       if (!data || data.format !== 'flash-cards-backup' || !data.state || typeof data.state.decks !== 'object') throw new Error('Not a Flash Cards backup file.');
       if (!confirm('Replace all data on this device with the backup?')) return;
-      state = Object.assign({ decks: {}, theme: null, studied: null }, data.state);
+      state = migrate(Object.assign({ decks: {}, theme: null, studied: null }, data.state));
       save(); applyTheme(); go('#/');
     } catch (e) { msg.textContent = 'Import failed: ' + e.message; msg.className = 'err'; }
   });
@@ -553,6 +594,15 @@ function viewSync() {
 function viewStudy(deck) {
   if (!session || session.deckId !== deck.id) session = { deckId: deck.id, revealed: false, current: null };
   const now = new Date();
+  if (!deck.cards.some(c => c.included !== false)) {
+    session.current = null;
+    return show(h('div', { class: 'panel' },
+      h('h2', {}, deck.name),
+      h('p', {}, deck.cards.length ? 'No included cards. Use Browse to include cards.' : 'This deck has no cards yet.'),
+      h('div', { class: 'row' },
+        h('button', { class: 'primary', onclick: () => go('#/browse/' + deck.id) }, 'Go to Browse'),
+        h('button', { onclick: () => go('#/') }, 'Done'))));
+  }
   const { item, nextLearn } = pickNext(deck, now);
   const done = (text) => { session.current = null; show(h('div', { class: 'panel' },
     h('h2', {}, deck.name),
@@ -563,7 +613,7 @@ function viewStudy(deck) {
   if (!item) {
     return done(nextLearn
       ? 'Nothing due right now. Next card in ' + fmtInterval(nextLearn, now) + '.'
-      : deck.cards.length ? 'All done for today! 🎉' : 'This deck has no cards yet.');
+      : 'All done for today! 🎉');
   }
   session.current = item; session.revealed = false; session.shownAt = Date.now();
   const fsrsCard = getFsrsCard(deck, item.key);
@@ -631,7 +681,7 @@ function route() {
   else if (parts[0] === 'import') viewImport(parts[1] && deckById(parts[1]) ? parts[1] : null);
   else if (parts[0] === 'select') viewSelect();
   else if (parts[0] === 'add') viewAdd();
-  else if (parts[0] === 'browse') viewBrowse();
+  else if (parts[0] === 'browse') viewBrowse(parts[1] || '');
   else if (parts[0] === 'stats') viewStats();
   else if (parts[0] === 'sync') viewSync();
   else if (deck && parts[2] === 'settings') viewSettings(deck);
