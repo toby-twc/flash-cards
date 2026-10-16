@@ -9,7 +9,13 @@
 </head>
 <body>
 <header>
-  <a href="#/" class="brand">Flash Cards</a>
+  <nav aria-label="Main">
+    <a href="#/" data-nav="decks">Decks</a>
+    <a href="#/add" data-nav="add">Add</a>
+    <a href="#/browse" data-nav="browse">Browse</a>
+    <a href="#/stats" data-nav="stats">Stats</a>
+    <a href="#/sync" data-nav="sync">Sync</a>
+  </nav>
   <button id="theme" type="button" aria-label="Toggle light/dark mode">◐</button>
 </header>
 <main id="app"></main>
