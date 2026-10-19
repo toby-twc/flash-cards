@@ -199,12 +199,13 @@ function counts(deck, now) {
     learn, totalNew: nw
   };
 }
-function pickNext(deck, now) {
+function pickNext(deck, now, session) {
   const daily = dailyCounts(deck, now);
   const end = nextMidnight(now);
-  const learn = [], rev = [], nw = [];
+  const pool = [], learn = [], rev = [], nw = [];
   let nextLearn = null;
   for (const it of allItems(deck)) {
+    if (session.retry.has(it.card.id)) { pool.push(it); continue; }
     const s = deck.sched[it.key];
     if (!s) { nw.push(it); continue; }
     const due = new Date(s.due);
@@ -212,11 +213,18 @@ function pickNext(deck, now) {
     else if (due <= now) learn.push({ it, due });
     else if (!nextLearn || due < nextLearn) nextLearn = due;
   }
-  const byDue = (a, b) => a.due - b.due;
-  if (learn.length) return { item: learn.sort(byDue)[0].it };
-  if (rev.length && daily.reviewsDone < deck.settings.reviewsPerDay) return { item: rev.sort(byDue)[0].it };
-  if (nw.length && daily.newDone < deck.settings.newPerDay) return { item: nw[0] };
-  return { item: null, nextLearn };
+  for (const l of learn) pool.push(l.it);
+  const revLeft = Math.max(0, deck.settings.reviewsPerDay - daily.reviewsDone);
+  const newLeft = Math.max(0, deck.settings.newPerDay - daily.newDone);
+  for (const r of rev.sort((a, b) => a.due - b.due).slice(0, revLeft)) pool.push(r.it);
+  for (const n of nw.slice(0, newLeft)) pool.push(n);
+  const rankOf = (it) => (session.rank[it.card.id] ??= Math.random());
+  let cands = pool;
+  if (cands.length > 1) cands = cands.filter(it => it.card.id !== session.lastId);
+  if (!cands.length) return { item: null, nextLearn };
+  let best = cands[0];
+  for (const it of cands) if (rankOf(it) < rankOf(best)) best = it;
+  return { item: best };
 }
 function studiedToday(now) {
   const day = localDay(now);
@@ -300,6 +308,7 @@ function newDeck(name) {
 }
 
 function viewLibrary() {
+  session = null;
   const now = new Date();
   const decks = Object.values(state.decks);
   const num = (n, cls) => h('td', { class: 'num ' + (n > 0 ? cls : 'zero') }, n);
@@ -592,7 +601,7 @@ function viewSync() {
 }
 
 function viewStudy(deck) {
-  if (!session || session.deckId !== deck.id) session = { deckId: deck.id, revealed: false, current: null };
+  if (!session || session.deckId !== deck.id) session = { deckId: deck.id, revealed: false, current: null, retry: new Set(), rank: {}, lastId: null };
   const now = new Date();
   if (!deck.cards.some(c => c.included !== false)) {
     session.current = null;
@@ -603,7 +612,7 @@ function viewStudy(deck) {
         h('button', { class: 'primary', onclick: () => go('#/browse/' + deck.id) }, 'Go to Browse'),
         h('button', { onclick: () => go('#/') }, 'Done'))));
   }
-  const { item, nextLearn } = pickNext(deck, now);
+  const { item, nextLearn } = pickNext(deck, now, session);
   const done = (text) => { session.current = null; show(h('div', { class: 'panel' },
     h('h2', {}, deck.name),
     h('p', {}, text),
@@ -620,7 +629,7 @@ function viewStudy(deck) {
   const reveal = () => { session.revealed = true; draw(); };
   const draw = () => {
     const rec = session.revealed ? fsrs.repeat(fsrsCard, now) : null;
-    const grade = (label, g) => h('button', { class: g === Rating.Good ? 'primary' : '', onclick: () => rate(g) },
+    const grade = (label, g) => h('button', { onclick: () => rate(g) },
       label, h('div', { class: 'muted' }, fmtInterval(rec[g].card.due, now)));
     session.reveal = session.revealed ? null : reveal;
     session.rate = session.revealed ? rate : null;
@@ -635,11 +644,16 @@ function viewStudy(deck) {
   const rate = (g) => {
     const t = new Date();
     const daily = dailyCounts(deck, t);
-    if (!deck.sched[item.key]) daily.newDone++;
-    else if (deck.sched[item.key].state === State.Review) daily.reviewsDone++;
+    if (!session.retry.has(item.card.id)) {
+      if (!deck.sched[item.key]) daily.newDone++;
+      else if (deck.sched[item.key].state === State.Review) daily.reviewsDone++;
+    }
     const st = studiedToday(t);
     st.count++; st.ms += Math.min(60000, t - session.shownAt);
     deck.sched[item.key] = fsrs.next(fsrsCard, t, g).card;
+    if (g === Rating.Again || g === Rating.Hard) { session.retry.add(item.card.id); session.rank[item.card.id] = Math.random(); }
+    else session.retry.delete(item.card.id);
+    session.lastId = item.card.id;
     save();
     viewStudy(deck);
   };
