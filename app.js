@@ -438,9 +438,7 @@ function viewSelect() {
     p.deckId ? h('p', {}, 'Adding to: ', h('strong', {}, state.decks[p.deckId].name)) : [h('label', {}, 'Deck name'), nameInput],
     h('div', { class: 'row' },
       h('button', { onclick: () => setAll(true) }, 'Select all'),
-      h('button', { onclick: () => setAll(false) }, 'Select none'), countEl),
-    search, listEl,
-    h('div', { class: 'row' },
+      h('button', { onclick: () => setAll(false) }, 'Select none'),
       h('button', { class: 'primary', onclick: () => {
         const chosen = p.cards.filter(c => checked.has(c.id)).map(c => ({ id: c.id, front: c.front, back: c.back, included: false }));
         if (!chosen.length) return alert('Select at least one card.');
@@ -448,6 +446,9 @@ function viewSelect() {
         deck.cards.push(...chosen);
         save(); pending = null; go('#/');
       } }, 'Add to deck'),
+      countEl),
+    search, listEl,
+    h('div', { class: 'row' },
       h('button', { onclick: () => { pending = null; go(p.deckId ? '#/deck/' + p.deckId + '/settings' : '#/'); } }, 'Cancel'))));
 }
 
