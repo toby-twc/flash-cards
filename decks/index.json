@@ -1,4 +1,6 @@
 [
-  {"name": "Norwegian basics", "file": "norwegian-basics.csv", "description": "Common Norwegian words (front: Norwegian, back: English)"},
-  {"name": "German basics", "file": "german-basics.csv", "description": "Common German words (front: German, back: English)"}
+  {"name": "German 1000", "file": "german_1000.csv", "description": "Common German words (front: German, back: English)"},
+  {"name": "French 1000", "file": "french_1000.csv", "description": "Common French words (front: French, back: English)"},
+  {"name": "Norwegian Bokmål 1000", "file": "norwegian_bokmal_1000.csv", "description": "Common Norwegian Bokmål words (front: Norwegian, back: English)"},
+  {"name": "Arabic 1000", "file": "arabic_1000.csv", "description": "Common Arabic words (front: Arabic, back: English)"}
 ]
